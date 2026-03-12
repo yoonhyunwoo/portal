@@ -2,20 +2,16 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
-	"fmt"
 	"os"
 	"os/signal"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/gosuda/portal/v2/sdk"
+	"github.com/gosuda/portal/v2/internal/tunnelruntime"
 	"github.com/gosuda/portal/v2/types"
 	"github.com/gosuda/portal/v2/utils"
 )
@@ -57,76 +53,20 @@ func main() {
 }
 
 func runTunnel() error {
-	logger := log.With().Str("component", "portal-tunnel").Logger()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	relayURLs := utils.SplitCSV(flagRelayURLs)
-	if flagDefaultRelays {
-		relayURLs = sdk.WithDefaultRelayURLs(ctx, relayURLs...)
-	}
-	relayURLs, err := utils.NormalizeRelayURLs(relayURLs)
-	if err != nil {
-		return fmt.Errorf("resolve relay urls: %w", err)
-	}
-
-	exposure, err := sdk.Expose(ctx, relayURLs, flagName, types.LeaseMetadata{
-		Description: flagDesc,
-		Tags:        utils.SplitCSV(flagTags),
-		Owner:       flagOwner,
-		Thumbnail:   flagThumbnail,
-		Hide:        flagHide,
+	return tunnelruntime.Run(ctx, tunnelruntime.Config{
+		RelayURLs:        utils.SplitCSV(flagRelayURLs),
+		UseDefaultRelays: flagDefaultRelays,
+		Name:             flagName,
+		LocalAddr:        flagHost,
+		Metadata: types.LeaseMetadata{
+			Description: flagDesc,
+			Tags:        utils.SplitCSV(flagTags),
+			Owner:       flagOwner,
+			Thumbnail:   flagThumbnail,
+			Hide:        flagHide,
+		},
 	})
-	if err != nil {
-		return fmt.Errorf("service %s: failed to start relays: %w", flagName, err)
-	}
-	if exposure == nil {
-		return errors.New("no relay URLs provided")
-	}
-	defer exposure.Close()
-
-	logger.Info().
-		Str("release_version", types.ReleaseVersion).
-		Str("local", flagHost).
-		Msg("starting portal tunnel")
-
-	var connWG sync.WaitGroup
-	var connCount atomic.Int64
-
-	go func() {
-		<-ctx.Done()
-		_ = exposure.Close()
-	}()
-
-	waitErr := proxyRelayConnections(ctx, exposure, flagHost, &connWG, &connCount)
-	if waitErr != nil {
-		stop()
-	}
-	closeErr := exposure.Close()
-	if waitErr != nil {
-		logger.Error().Err(waitErr).Msg("relay supervisor exited with error")
-	}
-	if closeErr != nil {
-		logger.Error().Err(closeErr).Msg("relay shutdown failed")
-	}
-
-	if ctx.Err() != nil {
-		logger.Info().Msg("tunnel shutting down")
-	}
-
-	done := make(chan struct{})
-	go func() {
-		connWG.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		logger.Warn().Msg("tunnel shutdown timeout; connections still active")
-	}
-
-	logger.Info().Msg("tunnel shutdown complete")
-	return errors.Join(waitErr, closeErr)
 }
