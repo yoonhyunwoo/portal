@@ -3,8 +3,12 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -343,6 +347,114 @@ func TestNewListenerRetriesForeverWhenRetryCountIsNegative(t *testing.T) {
 	})
 	if listener.done() {
 		t.Fatal("listener closed unexpectedly with negative RetryCount")
+	}
+}
+
+func TestRunReverseSessionActivatesAfterKeepalive(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	activated := make(chan net.Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		claimed, err := runReverseSession(context.Background(), serverConn, 50*time.Millisecond, func(_ context.Context, conn net.Conn) error {
+			activated <- conn
+			return nil
+		})
+		if !claimed {
+			errCh <- errors.New("session was not claimed")
+			return
+		}
+		errCh <- err
+	}()
+
+	if _, err := clientConn.Write([]byte{types.MarkerKeepalive, types.MarkerTLSStart}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	select {
+	case conn := <-activated:
+		if conn != serverConn {
+			t.Fatalf("activate conn = %v, want %v", conn, serverConn)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for activation")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("runReverseSession() error = %v", err)
+	}
+}
+
+func TestRunReverseSessionRejectsUnexpectedMarker(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		claimed, err := runReverseSession(context.Background(), serverConn, 50*time.Millisecond, func(context.Context, net.Conn) error {
+			return nil
+		})
+		if claimed {
+			errCh <- errors.New("session unexpectedly claimed")
+			return
+		}
+		errCh <- err
+	}()
+
+	if _, err := clientConn.Write([]byte{0xff}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "unexpected reverse marker") {
+		t.Fatalf("runReverseSession() error = %v, want unexpected reverse marker", err)
+	}
+}
+
+func TestRenewLeaseWithRecoveryReregistersOnLeaseNotFound(t *testing.T) {
+	t.Parallel()
+
+	var renewedTTL time.Duration
+	var reregistered atomic.Bool
+
+	err := renewLeaseWithRecovery(context.Background(), "lease-1", 42*time.Second, func(_ context.Context, leaseID string, ttl time.Duration) error {
+		if leaseID != "lease-1" {
+			t.Fatalf("leaseID = %q, want lease-1", leaseID)
+		}
+		renewedTTL = ttl
+		return &types.APIRequestError{Code: types.APIErrorCodeLeaseNotFound}
+	}, func(context.Context) error {
+		reregistered.Store(true)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("renewLeaseWithRecovery() error = %v", err)
+	}
+	if renewedTTL != 42*time.Second {
+		t.Fatalf("renew ttl = %v, want %v", renewedTTL, 42*time.Second)
+	}
+	if !reregistered.Load() {
+		t.Fatal("reregister was not called")
+	}
+}
+
+func TestRenewLeaseWithRecoveryReturnsNonLeaseNotFound(t *testing.T) {
+	t.Parallel()
+
+	wantErr := io.EOF
+	err := renewLeaseWithRecovery(context.Background(), "lease-1", 42*time.Second, func(context.Context, string, time.Duration) error {
+		return wantErr
+	}, func(context.Context) error {
+		t.Fatal("reregister should not be called")
+		return nil
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("renewLeaseWithRecovery() error = %v, want %v", err, wantErr)
 	}
 }
 

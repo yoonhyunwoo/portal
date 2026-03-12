@@ -284,29 +284,7 @@ func (l *Listener) runSession(ctx context.Context) (bool, error) {
 	l.sessionOpened()
 	defer l.sessionClosed()
 
-	var marker [1]byte
-	for {
-		_ = conn.SetReadDeadline(time.Now().Add(2 * l.handshakeTimeout))
-		if _, err := io.ReadFull(conn, marker[:]); err != nil {
-			_ = conn.Close()
-			return false, err
-		}
-		_ = conn.SetReadDeadline(time.Time{})
-
-		switch marker[0] {
-		case types.MarkerKeepalive:
-			continue
-		case types.MarkerTLSStart:
-			if err := l.activate(ctx, conn); err != nil {
-				_ = conn.Close()
-				return true, err
-			}
-			return true, nil
-		default:
-			_ = conn.Close()
-			return false, fmt.Errorf("unexpected reverse marker: 0x%02x", marker[0])
-		}
-	}
+	return runReverseSession(ctx, conn, l.handshakeTimeout, l.activate)
 }
 
 func (l *Listener) activate(ctx context.Context, conn net.Conn) error {
@@ -335,20 +313,7 @@ func (l *Listener) renewLease(ctx context.Context) error {
 	leaseID := l.leaseID
 	l.mu.Unlock()
 
-	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err := l.api.renewLease(requestCtx, leaseID, l.leaseTTL)
-	cancel()
-	if err == nil {
-		return nil
-	}
-	if !isLeaseNotFound(err) {
-		return err
-	}
-
-	if err := l.reregister(ctx); err != nil {
-		return err
-	}
-	return nil
+	return renewLeaseWithRecovery(ctx, leaseID, l.leaseTTL, l.api.renewLease, l.reregister)
 }
 
 func (l *Listener) registerAndConfigure(ctx context.Context) error {
@@ -399,6 +364,45 @@ func (l *Listener) reregister(ctx context.Context) error {
 	defer cancel()
 
 	return l.registerAndConfigure(requestCtx)
+}
+
+func runReverseSession(ctx context.Context, conn net.Conn, handshakeTimeout time.Duration, activate func(context.Context, net.Conn) error) (bool, error) {
+	var marker [1]byte
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * handshakeTimeout))
+		if _, err := io.ReadFull(conn, marker[:]); err != nil {
+			_ = conn.Close()
+			return false, err
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+
+		switch marker[0] {
+		case types.MarkerKeepalive:
+			continue
+		case types.MarkerTLSStart:
+			if err := activate(ctx, conn); err != nil {
+				_ = conn.Close()
+				return true, err
+			}
+			return true, nil
+		default:
+			_ = conn.Close()
+			return false, fmt.Errorf("unexpected reverse marker: 0x%02x", marker[0])
+		}
+	}
+}
+
+func renewLeaseWithRecovery(ctx context.Context, leaseID string, leaseTTL time.Duration, renew func(context.Context, string, time.Duration) error, reregister func(context.Context) error) error {
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err := renew(requestCtx, leaseID, leaseTTL)
+	cancel()
+	if err == nil {
+		return nil
+	}
+	if !isLeaseNotFound(err) {
+		return err
+	}
+	return reregister(ctx)
 }
 
 func isLeaseNotFound(err error) bool {
